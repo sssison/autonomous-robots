@@ -10,8 +10,17 @@ cmake ..
 # make sure no errors
 make
 # if no errors
+# defaults: robot IP 192.168.2.100, default motion time 1.0 s
 ./motion_server
+# override either or both:
+./motion_server --robot-ip 192.168.2.101
+./motion_server --default-motion-time 2.5
+./motion_server --robot-ip 192.168.2.101 --default-motion-time 2.5
+# print flag help
+./motion_server --help
 ```
+
+`--robot-ip` sets the Franka controller address; `--default-motion-time` sets the default and minimum trajectory duration (in seconds) used when a `moveToCartesian`/`moveToJointPose` call omits or under-specifies its `tf` argument.
 
 Test using python.
 **NOTE** : API changes. Instead of absolute angles in radians, the angle parameters are in delta of the init angles. All in degrees.

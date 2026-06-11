@@ -1,14 +1,7 @@
 // sudo apt-get install libcpprest-dev
-// g++ -std=c++11  bdm_motion_server.cpp -o bdm_motion_server -lcpprest -lssl -lcrypto -lboost_system
+// g++ -std=c++11  motion_server.cpp -o motion_server -lcpprest -lssl -lcrypto -lboost_system
 // test:
 // curl -X POST http://192.168.2.100:34568 -H "Content-Type: application/json" -d '{"moveToCartesian": [0.5, 0, 0.3]}'
-//
-// Changes from motion_server.cpp:
-//   - Constructor now calls automaticErrorRecovery() on startup to clear any stale error state
-//   - moveToCartesian() catches franka::Exception, calls automaticErrorRecovery() to
-//     unlock the robot, then returns HTTP 400 with a "collision_recovery:" prefix so
-//     the Python side can decide what motion to perform next.
-//   - initialize() uses the same goHome() prompt as motion_server (press Enter before moving).
 
 #include <cpprest/http_listener.h>
 #include <cpprest/json.h>
@@ -24,8 +17,14 @@ class RobotHandler {
     franka::Robot robot;
     franka::Gripper gripper;
     std::mutex robot_mutex;  // libfranka is not thread-safe; serialize all robot calls
+    double default_motion_time_;
 public:
-    RobotHandler(const std::string& ip_addr) : robot(ip_addr), gripper(ip_addr) {
+    // kIgnore lets robot.control() run on a non-PREEMPT_RT kernel; trade-off
+    // is missed-deadline warnings and slightly jerky cubic trajectories.
+    RobotHandler(const std::string& ip_addr, double default_motion_time)
+        : robot(ip_addr, franka::RealtimeConfig::kIgnore),
+          gripper(ip_addr),
+          default_motion_time_(default_motion_time) {
         // Clear any pre-existing error state left over from a previous run
         try {
             robot.automaticErrorRecovery();
@@ -33,21 +32,104 @@ public:
             // No error to recover from — this is fine
             std::cerr << "Startup error recovery (may be benign): " << e.what() << std::endl;
         }
-        // Note: setDefaultBehavior() intentionally NOT called here.
-        // It overrides Desk-configured force thresholds with values that may be
-        // too low for the robot's current pose, triggering a false collision stop.
+        // Loosen reflex thresholds: kIgnore trajectories are noisier than RT
+        // and trip Desk's defaults. Acceleration thresholds set near hardware
+        // limits (87 Nm torque, 100 N force) to ignore transient spikes;
+        // nominal thresholds left moderate so steady-state contact is caught.
+        try {
+            robot.setCollisionBehavior(
+                {{87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0}},
+                {{87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0}},
+                {{30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0}},
+                {{30.0, 30.0, 30.0, 30.0, 30.0, 30.0, 30.0}},
+                {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0}},
+                {{100.0, 100.0, 100.0, 100.0, 100.0, 100.0}},
+                {{50.0, 50.0, 50.0, 50.0, 50.0, 50.0}},
+                {{50.0, 50.0, 50.0, 50.0, 50.0, 50.0}}
+            );
+        } catch (const franka::Exception& e) {
+            std::cerr << "[ctor] setCollisionBehavior failed: " << e.what() << std::endl;
+        }
+    }
+
+    // kIgnore-compatible cubic joint trajectory to home. Fallback for when
+    // goHome() (RT-only) throws. Long tf keeps wrist angular velocity low
+    // enough to avoid Cartesian force spikes during the homing swing.
+    void goHomeJoints(double tf = 10.0) {
+        const std::array<double, 7> q_home = {
+            0.0, -M_PI_4, 0.0, -3.0 * M_PI_4, 0.0, M_PI_2, M_PI_4
+        };
+        std::array<double, 7> q_initial{};
+        double time = 0.0;
+
+        robot.control(
+            [&time, &q_initial, q_home, tf]
+            (const franka::RobotState& state, franka::Duration period) -> franka::JointPositions {
+                time += period.toSec();
+                if (time == 0.0) {
+                    q_initial = state.q;
+                }
+                std::array<double, 7> q_target = q_initial;
+                double t2 = pow(time, 2);
+                double t3 = pow(time, 3);
+                double tf2 = pow(tf, 2);
+                double tf3 = pow(tf, 3);
+                for (int i = 0; i < 7; ++i) {
+                    double delta = q_home[i] - q_initial[i];
+                    double a2 = 3.0 * delta / tf2;
+                    double a3 = -2.0 * delta / tf3;
+                    q_target[i] = q_initial[i] + a2 * t2 + a3 * t3;
+                }
+                franka::JointPositions output = q_target;
+                if (time >= tf) {
+                    std::cout << "[goHomeJoints] reached home pose" << std::endl;
+                    return franka::MotionFinished(output);
+                }
+                return output;
+            }
+        );
     }
 
     void initialize() {
-        // Same startup behaviour as motion_server: prompt user before moving.
-        // If the arm can't reach home (obstacle, joint limit), abort with a clear message.
+        // Try RT-only goHome() first, fall back to kIgnore-friendly
+        // goHomeJoints() if it throws. If both fail, the rest of the server
+        // still works -- the robot just stays where it was.
+        bool homed = false;
         try {
             goHome(robot);
+            homed = true;
         } catch (const franka::Exception& e) {
-            throw std::runtime_error(
-                std::string("initialize(): failed to move to home position: ") + e.what());
+            std::cerr << "[initialize] goHome skipped: " << e.what() << std::endl;
         }
-        gripper.homing();
+        if (!homed) {
+            // Clear Reflex mode before the fallback; otherwise robot.control()
+            // rejects with "command not possible in the current mode (Reflex)".
+            try {
+                robot.automaticErrorRecovery();
+                std::cerr << "[initialize] cleared Reflex state, retrying..." << std::endl;
+            } catch (const franka::Exception& e) {
+                std::cerr << "[initialize] pre-fallback recovery failed: "
+                          << e.what() << std::endl;
+            }
+            std::cerr << "[initialize] Falling back to goHomeJoints "
+                      << "(cubic joint trajectory under kIgnore)..." << std::endl;
+            try {
+                goHomeJoints();
+                homed = true;
+            } catch (const franka::Exception& e) {
+                std::cerr << "[initialize] goHomeJoints also failed: "
+                          << e.what() << std::endl;
+                try {
+                    robot.automaticErrorRecovery();
+                } catch (...) {}
+                std::cerr << "[initialize] Continuing without homing." << std::endl;
+            }
+        }
+        try {
+            gripper.homing();
+        } catch (const franka::Exception& e) {
+            std::cerr << "[initialize] gripper.homing skipped: " << e.what() << std::endl;
+        }
 
         franka::Model model = robot.loadModel();
         const franka::RobotState& robot_state = robot.readOnce();
@@ -118,6 +200,105 @@ public:
         return true;
     }
 
+    bool isValidJointPose(const std::array<double, 7>& q) {
+        // Franka Emika Panda joint limits (radians)
+        static const std::array<double, 7> q_min = {
+            -2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973
+        };
+        static const std::array<double, 7> q_max = {
+            2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973
+        };
+        for (int i = 0; i < 7; ++i) {
+            if (q[i] < q_min[i] || q[i] > q_max[i]) {
+                std::cerr << "Joint " << (i + 1) << " target " << q[i]
+                          << " rad outside ["
+                          << q_min[i] << ", " << q_max[i] << "]" << std::endl;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Cubic joint trajectory to a 7-DOF target. Accepts 7 joint angles
+    // (rad); optional 8th value is tf, clamped to >= default_motion_time_.
+    // Returns measured final q.
+    std::vector<double> moveToJointPose(const std::vector<float> &numbers) {
+        std::lock_guard<std::mutex> lock(robot_mutex);
+        std::vector<double> final_q(7, 0.0);
+        if (numbers.size() < 7) {
+            throw std::runtime_error(
+                "moveToJointPose requires at least 7 joint angles (rad).");
+        }
+        std::array<double, 7> q_target_raw;
+        for (int i = 0; i < 7; ++i) {
+            q_target_raw[i] = static_cast<double>(numbers[i]);
+        }
+        if (!isValidJointPose(q_target_raw)) {
+            throw std::runtime_error(
+                "Joint target outside Franka joint limits.");
+        }
+        double tf = default_motion_time_;
+        if (numbers.size() >= 8) {
+            tf = static_cast<double>(numbers[7]);
+            if (tf < default_motion_time_) {
+                tf = default_motion_time_;
+            }
+        }
+        std::array<double, 7> q_initial{};
+        double time = 0.0;
+        const std::array<double, 7> q_target = q_target_raw;
+
+        try {
+            robot.control(
+                [&time, &q_initial, q_target, tf]
+                (const franka::RobotState& state, franka::Duration period)
+                    -> franka::JointPositions {
+                    time += period.toSec();
+                    if (time == 0.0) {
+                        q_initial = state.q;
+                    }
+                    std::array<double, 7> q_cur = q_initial;
+                    double t2 = pow(time, 2);
+                    double t3 = pow(time, 3);
+                    double tf2 = pow(tf, 2);
+                    double tf3 = pow(tf, 3);
+                    for (int i = 0; i < 7; ++i) {
+                        double delta = q_target[i] - q_initial[i];
+                        double a2 = 3.0 * delta / tf2;
+                        double a3 = -2.0 * delta / tf3;
+                        q_cur[i] = q_initial[i] + a2 * t2 + a3 * t3;
+                    }
+                    franka::JointPositions output = q_cur;
+                    if (time >= tf) {
+                        std::cout << time
+                                  << "sec : End of joint motion ........."
+                                  << std::endl;
+                        return franka::MotionFinished(output);
+                    }
+                    return output;
+                }
+            );
+        } catch (const franka::Exception &ex) {
+            std::cerr << "franka::Exception during moveToJointPose: "
+                      << ex.what() << std::endl;
+            try {
+                robot.automaticErrorRecovery();
+            } catch (const franka::Exception &re) {
+                throw std::runtime_error(
+                    std::string("collision_recovery_failed: original=")
+                    + ex.what() + " recovery=" + re.what());
+            }
+            throw std::runtime_error(
+                std::string("collision_recovery: ") + ex.what());
+        }
+
+        franka::RobotState st = robot.readOnce();
+        for (int i = 0; i < 7; ++i) {
+            final_q[i] = st.q[i];
+        }
+        return final_q;
+    }
+
     // moveToCartesian accepts three float numbers in a vector
     std::vector<double> moveToCartesian(const std::vector<float> &numbers)
     {
@@ -143,18 +324,16 @@ public:
         double deltaAlpha = 0.0, deltaBeta = 0.0, deltaGamma = 0.0;
         double Alphaf = 0.0, Betaf = 0.0, Gammaf = 0.0;
         bool is_rotation = false;
-        const double DEFAULT_MOTION_TIME = 5.0;
-
         if (numbers.size() < 4)
         {
-            tf = DEFAULT_MOTION_TIME;
+            tf = default_motion_time_;
         }
         else if (numbers.size() >= 4)
         {
             tf = numbers[3];
-            if (tf < DEFAULT_MOTION_TIME)
+            if (tf < default_motion_time_)
             {
-            tf = DEFAULT_MOTION_TIME;
+                tf = default_motion_time_;
             }
         }
 
@@ -315,12 +494,13 @@ public:
                     " recovery=" + recovery_ex.what());
             }
 
-            // The "collision_recovery:" prefix lets mainutilsedgrasper.py detect this case.
+            // "collision_recovery:" prefix is parsed by the Python client.
             throw std::runtime_error(std::string("collision_recovery: ") + ex.what());
         }
 
         final_pose = robot.readOnce().O_T_EE;
-        std::tuple<double, double, double> final_angles = getRotationAngles();
+        // Reuse the cached pose to skip a second readOnce inside getRotationAngles.
+        std::tuple<double, double, double> final_angles = getRotationAngles(&final_pose);
         final_coords[0] = final_pose[12];
         final_coords[1] = final_pose[13];
         final_coords[2] = final_pose[14];
@@ -333,13 +513,16 @@ public:
     std::string closeGripper(const std::vector<float> &numbers) {
         std::lock_guard<std::mutex> lock(robot_mutex);
         try {
-            double grasping_width = numbers[0];
+            // GUI sends `{"closeGripper": []}`; indexing the empty vector is
+            // UB, so default to 0.01 m so the fingers squeeze small objects.
+            double grasping_width = numbers.empty() ? 0.01 : static_cast<double>(numbers[0]);
             franka::GripperState gripper_state = gripper.readOnce();
             if (gripper_state.max_width < grasping_width) {
                 return "Object is too large for the current fingers on the gripper: " + std::to_string(gripper_state.max_width);
             }
-            // gripper.grasp(width, speed, force, epsilon_inner=0.005, epsilon_outer=0.005)
-            if (!gripper.grasp(grasping_width, 0.1, 0.0, 0.01, 0.01)) {
+            // 40 N force + wide epsilon so small objects (~0.5-6 cm) clamp
+            // firmly regardless of exact width.
+            if (!gripper.grasp(grasping_width, 0.1, 40.0, 0.05, 0.05)) {
                 return "Failed to grasp object.";
             }
             std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(100));
@@ -359,7 +542,8 @@ public:
         try
         {
             franka::GripperState gripper_state = gripper.readOnce();
-            double speed = numbers[0];
+            // Empty-vector guard: GUI sends `{"openGripper": []}`.
+            double speed = numbers.empty() ? 0.1 : static_cast<double>(numbers[0]);
             std::cout << "Grasped object, will release it now." << std::endl;
             gripper.move(gripper_state.max_width, speed);
             gripper.stop();
@@ -371,9 +555,7 @@ public:
         return "Gripper opened successfully.";
     }
 
-    // Returns current end-effector pose: [x, y, z, alpha_deg, beta_deg, gamma_deg].
-    // Used by Python to obtain the actual current rotation before issuing a reset move,
-    // since after a collision the arm may have stopped at an unknown intermediate angle.
+    // Current EE pose: [x, y, z, alpha_deg, beta_deg, gamma_deg].
     std::vector<double> readState()
     {
         std::lock_guard<std::mutex> lock(robot_mutex);
@@ -385,12 +567,24 @@ public:
                 beta  * 180.0 / M_PI,
                 gamma * 180.0 / M_PI};
     }
+
+    // Current joint angles [q1..q7] in radians.
+    std::vector<double> readJointState()
+    {
+        std::lock_guard<std::mutex> lock(robot_mutex);
+        const franka::RobotState& state = robot.readOnce();
+        std::vector<double> q(7);
+        for (int i = 0; i < 7; ++i) {
+            q[i] = state.q[i];
+        }
+        return q;
+    }
 };
 
 class RobotRestAPI {
 public:
-    RobotRestAPI(utility::string_t url, const std::string& robot_ip)
-        : m_listener(url), robotHandler(robot_ip) {
+    RobotRestAPI(utility::string_t url, const std::string& robot_ip, double default_motion_time)
+        : m_listener(url), robotHandler(robot_ip, default_motion_time) {
         m_listener.support(methods::POST, std::bind(&RobotRestAPI::handle_post, this, std::placeholders::_1));
         robotHandler.initialize();
     }
@@ -437,6 +631,11 @@ private:
                         for (int i = 0; i < 6; ++i) {
                             response[key][i] = json::value::number(final_coords[i]);
                         }
+                    } else if (key == "moveToJointPose") {
+                        std::vector<double> final_q = robotHandler.moveToJointPose(numbers);
+                        for (int i = 0; i < 7; ++i) {
+                            response[key][i] = json::value::number(final_q[i]);
+                        }
                     } else if (key == "closeGripper") {
                         std::string message = robotHandler.closeGripper(numbers);
                         response[key] = json::value::string(message);
@@ -447,6 +646,11 @@ private:
                         std::vector<double> state = robotHandler.readState();
                         for (int i = 0; i < 6; ++i) {
                             response[key][i] = json::value::number(state[i]);
+                        }
+                    } else if (key == "readJointState") {
+                        std::vector<double> q = robotHandler.readJointState();
+                        for (int i = 0; i < 7; ++i) {
+                            response[key][i] = json::value::number(q[i]);
                         }
                     } else {
                         std::cout << "Invalid command: " << key << std::endl;
@@ -478,12 +682,55 @@ int main(int argc, char* argv[]) {
     std::string address = "http://0.0.0.0:" + port;
     utility::string_t utility_address = utility::conversions::to_string_t(address);
     std::string robot_ip = "192.168.2.100";
+    double default_motion_time = 1.0;
 
-    if (argc == 2) {
-        robot_ip = argv[1];
+    auto print_usage = [&](std::ostream& os) {
+        os << "Usage: " << argv[0] << " [--robot-ip <ip>] "
+           << "[--default-motion-time <seconds>] [-h|--help]\n"
+           << "  --robot-ip <ip>                Franka robot IP (default: 192.168.2.100)\n"
+           << "  --default-motion-time <sec>    Default/min trajectory duration (default: 1.0)\n";
+    };
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-h" || arg == "--help") {
+            print_usage(std::cout);
+            return 0;
+        } else if (arg == "--robot-ip") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --robot-ip requires a value.\n";
+                print_usage(std::cerr);
+                return 1;
+            }
+            robot_ip = argv[++i];
+        } else if (arg == "--default-motion-time") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --default-motion-time requires a value.\n";
+                print_usage(std::cerr);
+                return 1;
+            }
+            try {
+                default_motion_time = std::stod(argv[++i]);
+            } catch (const std::exception& e) {
+                std::cerr << "Error: --default-motion-time must be a number, got '"
+                          << argv[i] << "'.\n";
+                print_usage(std::cerr);
+                return 1;
+            }
+            if (default_motion_time <= 0.0) {
+                std::cerr << "Error: --default-motion-time must be > 0, got "
+                          << default_motion_time << ".\n";
+                print_usage(std::cerr);
+                return 1;
+            }
+        } else {
+            std::cerr << "Error: unknown argument '" << arg << "'.\n";
+            print_usage(std::cerr);
+            return 1;
+        }
     }
 
-    RobotRestAPI api(utility_address, robot_ip);
+    RobotRestAPI api(utility_address, robot_ip, default_motion_time);
 
     try {
         api.open().wait();
